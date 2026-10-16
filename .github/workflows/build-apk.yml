@@ -1,0 +1,315 @@
+name: Build Android APK
+
+# One build strategy per run, chosen deterministically (never mixed):
+# A) REPO mode - a settings.gradle(.kts) is tracked in the repository -> build the files as committed.
+# B) ZIP mode - the repository tracks no Gradle project, but exactly one .zip holds one
+# -> that zip is validated, safely extracted on the runner and built.
+# Anything else fails with a file inventory. The chosen mode is printed in the run summary.
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+# "contents: write" is only used to publish the APK on the Releases page (optional step).
+permissions:
+  contents: write
+
+env:
+  ANDROID_PLATFORM: "36"      # must equal compileSdk in app/build.gradle.kts
+  ANDROID_BUILD_TOOLS: "35.0.0"
+  JAVA_VERSION: "17"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Locate the Android project (REPO or ZIP mode)
+        id: project
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          WS="$GITHUB_WORKSPACE"
+
+          # Shallowest settings.gradle(.kts) below $1, ignoring build output and VCS folders.
+          find_settings() {
+            find "$1" -maxdepth 4 -type f \( -name 'settings.gradle.kts' -o -name 'settings.gradle' \) \
+              -not -path '*/__MACOSX/*' -not -path '*/.git/*' -not -path '*/build/*' \
+              -print 2>/dev/null \
+              | awk -F/ '{ print NF "\t" $0 }' | sort -n | sed -n '1p' | cut -f2-
+          }
+
+          inventory() {
+            echo "Tracked files (first 60):"
+            git -c core.quotepath=false ls-files | head -n 60 || true
+          }
+
+          MODE=""
+          SETTINGS="$(find_settings "$WS" || true)"
+
+          if [ -n "$SETTINGS" ]; then
+            MODE="repo"
+            echo "REPO mode: found $SETTINGS"
+          else
+            mapfile -t ZIPS < <(git -c core.quotepath=false ls-files | grep -i '\.zip$' || true)
+            echo "Tracked zip files: ${#ZIPS[@]}"
+            CANDIDATES=()
+            for z in "${ZIPS[@]}"; do
+              [ -n "$z" ] || continue
+              if unzip -Z1 "$z" 2>/dev/null | grep -E '(^|/)settings\.gradle(\.kts)?$' >/dev/null; then
+                CANDIDATES+=("$z")
+              else
+                echo "Skipping '$z': no settings.gradle(.kts) inside."
+              fi
+            done
+            if [ "${#CANDIDATES[@]}" -eq 0 ]; then
+              echo "::error title=No Android project found::The repository has no settings.gradle(.kts) and no .zip containing one."
+              { echo "### No Android project found"; echo '```'; inventory; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+            if [ "${#CANDIDATES[@]}" -gt 1 ]; then
+              echo "::error title=Several project zips::Keep exactly one project .zip in the repository. Found: ${CANDIDATES[*]}"
+              exit 1
+            fi
+            MODE="zip"
+            ZIP="${CANDIDATES[0]}"
+            DEST="$WS/_project"
+            rm -rf "$DEST"; mkdir -p "$DEST"
+            echo "ZIP mode: $ZIP"
+            echo "ZIP inventory (first 80 entries):"
+            LISTING="$(unzip -Z1 "$ZIP")"
+            printf '%s\n' "$LISTING" | sed -n '1,80p' 
+
+            # Reject absolute paths, "..", backslashes and symlinks BEFORE extracting anything.
+            python3 - "$ZIP" "$DEST" <<'PY'
+          import os, stat, sys, zipfile
+          zpath, dest = sys.argv[1], os.path.realpath(sys.argv[2])
+          with zipfile.ZipFile(zpath) as z:
+              for info in z.infolist():
+                  name = info.filename
+                  mode = (info.external_attr >> 16) & 0xFFFF
+                  if name.startswith("/") or "\\" in name or ".." in name.split("/"):
+                      sys.exit(f"Unsafe path in zip: {name!r}")
+                  if stat.S_ISLNK(mode):
+                      sys.exit(f"Symlink in zip is not allowed: {name!r}")
+                  target = os.path.realpath(os.path.join(dest, name))
+                  if target != dest and not target.startswith(dest + os.sep):
+                      sys.exit(f"Path escapes extraction folder: {name!r}")
+              z.extractall(dest)
+          print("Zip validated and extracted.")
+          PY
+            rm -rf "$DEST/__MACOSX"
+            SETTINGS="$(find_settings "$DEST" || true)"
+            if [ -z "$SETTINGS" ]; then
+              echo "::error::Extracted zip has no settings.gradle(.kts) within 4 levels."
+              find "$DEST" -maxdepth 3 | head -n 80
+              exit 1
+            fi
+          fi
+
+          ROOT="$(dirname "$SETTINGS")"
+          echo "Project root: $ROOT"
+
+          # Verify every required file really exists (never trust a README).
+          MISSING=0
+          need() { if [ ! -e "$ROOT/$1" ]; then echo "::error::Missing required file: $1 (looked in $ROOT)"; MISSING=1; fi; }
+          need gradlew
+          need gradle/wrapper/gradle-wrapper.jar
+          need gradle/wrapper/gradle-wrapper.properties
+          need app/src/main/AndroidManifest.xml
+          if [ ! -e "$ROOT/app/build.gradle.kts" ] && [ ! -e "$ROOT/app/build.gradle" ]; then
+            echo "::error::Missing required file: app/build.gradle(.kts)"; MISSING=1
+          fi
+          if [ -e "$ROOT/app/app/src/main/AndroidManifest.xml" ]; then
+            echo "::error::Doubled path app/app/... detected: the project was zipped one level too deep."; MISSING=1
+          fi
+          if [ "$MISSING" -ne 0 ]; then
+            echo "Content of $ROOT:"; ls -la "$ROOT"
+            exit 1
+          fi
+
+          # The wrapper jar must be a real zip, not a git-lfs pointer or an empty file.
+          unzip -tq "$ROOT/gradle/wrapper/gradle-wrapper.jar" >/dev/null \
+            || { echo "::error::gradle-wrapper.jar is not a valid jar (git-lfs pointer or corrupt)."; exit 1; }
+
+          echo "dir=$ROOT" >> "$GITHUB_OUTPUT"
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Project"
+            echo "- Mode: **$MODE**"
+            echo "- Root: \`${ROOT#$WS/}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Install and verify Android SDK packages
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          [ -d "$SDK" ] || { echo "::error::Android SDK root not found: $SDK"; exit 1; }
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "SDK root used by Gradle: $SDK"
+
+          SDKM="$(command -v sdkmanager || true)"
+          [ -n "$SDKM" ] || SDKM="$(find "$SDK/cmdline-tools" -maxdepth 3 -name sdkmanager -type f 2>/dev/null | sort -V | tail -n 1 || true)"
+          [ -n "$SDKM" ] || { echo "::error::sdkmanager not found under $SDK/cmdline-tools"; exit 1; }
+          echo "Using $SDKM"
+
+          # Licenses are accepted for exactly the SDK root exported above.
+          yes | "$SDKM" --sdk_root="$SDK" --licenses >/dev/null 2>&1 || true
+          # Only the packages this project needs. The obsolete package "tools" is never requested.
+          "$SDKM" --sdk_root="$SDK" --install "platforms;android-${ANDROID_PLATFORM}" "build-tools;${ANDROID_BUILD_TOOLS}"
+
+          test -f "$SDK/platforms/android-${ANDROID_PLATFORM}/android.jar" \
+            || { echo "::error::platforms;android-${ANDROID_PLATFORM} not installed"; exit 1; }
+          test -d "$SDK/build-tools/${ANDROID_BUILD_TOOLS}" \
+            || { echo "::error::build-tools;${ANDROID_BUILD_TOOLS} not installed"; exit 1; }
+          ls "$SDK/licenses" | head
+          echo "SDK packages verified."
+
+      # setup-gradle v4 validates every gradle-wrapper.jar against Gradle's published checksums
+      # and fails on unknown jars. No jar is ever "repaired" or replaced silently.
+      - name: Set up Gradle (wrapper validation + caching)
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          build-root-directory: ${{ steps.project.outputs.dir }}
+
+      - name: Make gradlew executable
+        working-directory: ${{ steps.project.outputs.dir }}
+        run: chmod +x gradlew
+
+      - name: Gradle version check
+        working-directory: ${{ steps.project.outputs.dir }}
+        timeout-minutes: 10
+        shell: bash
+        run: ./gradlew --no-daemon --stacktrace --console=plain --version
+
+      - name: Gradle tasks
+        working-directory: ${{ steps.project.outputs.dir }}
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          set -o pipefail
+          ./gradlew --no-daemon --stacktrace --console=plain tasks 2>&1 | tee "$GITHUB_WORKSPACE/gradle-tasks.log"
+
+      - name: Build the debug APK
+        id: build
+        working-directory: ${{ steps.project.outputs.dir }}
+        timeout-minutes: 30
+        shell: bash
+        run: |
+          set -o pipefail
+          ./gradlew --no-daemon --stacktrace --console=plain assembleDebug 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+
+      - name: Summarize build errors
+        if: failure() && steps.build.conclusion == 'failure'
+        shell: bash
+        run: |
+          [ -f build.log ] || exit 0
+          {
+            echo "### Build failed - important lines"
+            echo '```'
+            { grep -E '^e: |error:|\* What went wrong|Execution failed|Could not resolve|FAILED' -A2 build.log | head -n 80; } || true
+            echo '```'
+            echo "Full log: artifact **diagnostics**."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Locate and validate the APK
+        id: apk
+        working-directory: ${{ steps.project.outputs.dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # AGP's real default output location for the app module's debug variant.
+          DIR="app/build/outputs/apk/debug"
+          [ -d "$DIR" ] || { echo "::error::$DIR does not exist - assembleDebug produced no APK folder."; exit 1; }
+          ls -la "$DIR"
+          APK="$(find "$DIR" -maxdepth 1 -name '*.apk' -type f | sort | sed -n '1p')"
+          [ -n "$APK" ] || { echo "::error::No .apk in $DIR"; exit 1; }
+          [ -s "$APK" ] || { echo "::error::$APK is empty"; exit 1; }
+          unzip -tq "$APK" >/dev/null || { echo "::error::$APK is not a valid zip/APK"; exit 1; }
+          APK_LIST="$(unzip -Z1 "$APK")"
+          printf '%s\n' "$APK_LIST" | grep -qx 'AndroidManifest.xml' || { echo "::error::$APK has no AndroidManifest.xml"; exit 1; }
+          printf '%s\n' "$APK_LIST" | grep -qE '^classes[0-9]*\.dex$' || { echo "::error::$APK has no classes.dex"; exit 1; }
+          mkdir -p "$GITHUB_WORKSPACE/apk-out"
+          cp "$APK" "$GITHUB_WORKSPACE/apk-out/PDFMaster-debug.apk"
+          SIZE="$(du -h "$APK" | cut -f1)"
+          sha256sum "$GITHUB_WORKSPACE/apk-out/PDFMaster-debug.apk"
+          {
+            echo "### APK ready"
+            echo "- Source file: \`$APK\` ($SIZE)"
+            echo "- Download: **Artifacts** section below (or the Releases page)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: PDFMaster-debug-apk
+          path: apk-out/PDFMaster-debug.apk
+          if-no-files-found: error
+
+      # Runs after the APK exists, so a failing test never hides a good APK; the result is
+      # still reported in the summary and the reports are uploaded.
+      - name: Run unit tests
+        id: tests
+        continue-on-error: true
+        working-directory: ${{ steps.project.outputs.dir }}
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          set -o pipefail
+          ./gradlew --no-daemon --stacktrace --console=plain testDebugUnitTest 2>&1 | tee "$GITHUB_WORKSPACE/unit-tests.log"
+
+      - name: Report unit-test result
+        if: always() && steps.tests.outcome != 'skipped'
+        shell: bash
+        run: |
+          echo "### Unit tests: ${{ steps.tests.outcome }}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostics
+          path: |
+            build.log
+            gradle-tasks.log
+            unit-tests.log
+            ${{ steps.project.outputs.dir }}/app/build/reports/
+            ${{ steps.project.outputs.dir }}/app/build/test-results/
+          if-no-files-found: ignore
+
+      # Optional convenience: a direct .apk link on the Releases page. Never blocks the build.
+      - name: Publish the APK on the Releases page
+        if: success() && github.event_name == 'push'
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="apk-latest"
+          gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes >/dev/null 2>&1 || true
+          gh release create "$TAG" "apk-out/PDFMaster-debug.apk" \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease \
+            --title "Latest debug APK" \
+            --notes "Built from commit ${GITHUB_SHA::7}. Download PDFMaster-debug.apk and open it on your phone."
